@@ -1,0 +1,19 @@
+# local tool state
+.claude/
+.agent/
+
+# internal design doc (home-lab details, not for publication)
+PROXY.md
+
+# runtime junk
+nohup.out
+*.log
+
+# debug dumps (AGY_PROXY_DEBUG)
+last_prompt.txt
+last_stderr.txt
+
+# python leftovers from the abandoned prototype
+__pycache__/
+*.pyc
+.venv/
