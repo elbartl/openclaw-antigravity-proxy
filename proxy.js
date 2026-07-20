@@ -431,7 +431,18 @@ const server = http.createServer((req, res) => {
                     clearInterval(watchdog);
                     stopLogWatch();
                     let logErr = null;
-                    try { logErr = extractAgyError(fs.readFileSync(logFile, 'utf8')); } catch (e) {}
+                    let logText = '';
+                    try { logText = fs.readFileSync(logFile, 'utf8'); } catch (e) {}
+                    try { logErr = extractAgyError(logText); } catch (e) {}
+                    // On a timeout kill, agy looked "stuck" — preserve its glog and
+                    // dump the tail so we can see what it was actually doing during
+                    // the silent window (waiting on a model round vs a hung tool).
+                    if (timedOut && logText) {
+                        const saved = path.join(os.tmpdir(), `agy-stuck-${process.pid}-${Date.now()}.log`);
+                        try { fs.writeFileSync(saved, logText); } catch (e) {}
+                        const tail = logText.trimEnd().split('\n').slice(-25).join('\n');
+                        console.log(`⛏ agy ${timedOut}-timeout glog zachowany: ${saved}\n----- ogon glog -----\n${tail}\n----- koniec -----`);
+                    }
                     try { fs.unlinkSync(logFile); } catch (e) {}
                     cb({ code, out, errOut, timedOut, spawnErr, logErr, rounds });
                 };
