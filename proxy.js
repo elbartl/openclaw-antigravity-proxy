@@ -19,22 +19,29 @@ const PORT = 8000;
 //   HARD — absolute ceiling regardless of activity (runaway protection)
 // SSE heartbeats still keep the client connection alive during silence.
 //
-// A model round is NOT the only kind of legitimate activity: a single tool call
-// (a shell command / script reading a big .docx over Nextcloud, an sshfs walk)
-// can run for many minutes with no new streamGenerateContent line and no stdout.
-// That used to trip the IDLE timeout and kill a perfectly healthy run mid-tool.
-// Fix: the watchdog also treats an active tool SUBPROCESS as activity — agy
-// spawns tools into its own process group, so any live descendant means "busy
-// running a tool", not "stuck". Background HTTP noise (quota/auth refresh) has
-// no subprocess, so it still can't defeat the idle timeout.
+// A model round is NOT the only kind of legitimate activity, and its glog line
+// (streamGenerateContent) is written ONCE at the START of the round — a single
+// slow round (Gemini Pro High, thinking, on a huge prompt) can then generate for
+// 8-12 min with no further log line and no stdout. A long tool call (a script
+// reading a big .docx over Nextcloud, an sshfs walk) is similar: minutes of
+// silence. Both used to trip the IDLE timeout and kill a perfectly healthy run.
+// Two mitigations:
+//   1. The watchdog treats an active tool SUBPROCESS as activity — agy spawns
+//      shell tools into its own process group, so any live descendant means
+//      "busy running a tool", not "stuck" (hasActiveToolChild).
+//   2. IDLE is generous enough to sit through one slow model round (no child,
+//      no log line) without killing. Background HTTP noise (quota/auth refresh)
+//      has no subprocess, so it still can't by itself defeat the timeout.
+// HARD stays the authoritative ceiling for a genuinely runaway/stuck process.
 const SOFT_TIMEOUT_MS = 720000;     // 12 min — extend past this only if agy is active
-const IDLE_TIMEOUT_MS = 480000;     // 8 min with no round, no stdout AND no live tool subprocess — kill
+const IDLE_TIMEOUT_MS = 900000;     // 15 min with no round, no stdout AND no live tool subprocess — long enough for one slow Pro round
 const HARD_TIMEOUT_MS = 1800000;    // 30 min — absolute kill (authoritative)
 const AGY_PRINT_TIMEOUT = '35m';    // agy's own budget, kept above HARD
 const WATCHDOG_MS = 15000;          // adaptive-timeout check cadence
 const LOG_POLL_MS = 2000;           // how often the agy log file is tailed
 const HEARTBEAT_MS = 15000;         // visible progress-tick cadence during silence
-const STATUS_MIN_GAP_MS = 60000;    // min spacing of visible status lines (append-only UI)
+const STATUS_MIN_GAP_MS = 60000;    // min spacing of visible round-update status lines (append-only UI)
+const PROGRESS_MAX_GAP_MS = 180000; // max spacing of ANY visible tick — kept under OpenClaw's ~400s stall/abort so a silent long tool never looks stalled to the client
 const MAX_ATTEMPTS = 2;             // one automatic retry on a transient agy failure
 
 // Keep the system prompt in full but cap raw conversation history so a
@@ -508,7 +515,19 @@ const server = http.createServer((req, res) => {
                     if (res.writableEnded || sentAny) return;
                     if (!lastVisibleAt) {
                         showStatus('⏳ Pracuję nad zadaniem, może potrwać kilka minut…\n');
+                    } else if (Date.now() - lastVisibleAt >= PROGRESS_MAX_GAP_MS) {
+                        // OpenClaw's stall detector aborts a run after ~400s with
+                        // no stream progress (invisible SSE comments do NOT count).
+                        // Rationed round-updates go silent during a long single
+                        // tool call, so force a visible tick well under that
+                        // threshold — a real content delta the client counts as
+                        // progress. Starts with ⏳ so stripProgress drops it later.
+                        showStatus(`⏳ [${elapsedMin()} min] pracuję nad zadaniem…\n`);
                     } else {
+                        // Between visible ticks: an empty-delta chunk still reads
+                        // as stream progress for the client but renders nothing,
+                        // plus an invisible SSE comment as a plain keepalive.
+                        sendDelta(null);
                         res.write(`: keepalive ${elapsed()}s\n\n`);
                     }
                 }, HEARTBEAT_MS);
