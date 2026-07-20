@@ -18,8 +18,17 @@ const PORT = 8000;
 //   IDLE — no model round AND no stdout for this long => agy is stuck, kill
 //   HARD — absolute ceiling regardless of activity (runaway protection)
 // SSE heartbeats still keep the client connection alive during silence.
+//
+// A model round is NOT the only kind of legitimate activity: a single tool call
+// (a shell command / script reading a big .docx over Nextcloud, an sshfs walk)
+// can run for many minutes with no new streamGenerateContent line and no stdout.
+// That used to trip the IDLE timeout and kill a perfectly healthy run mid-tool.
+// Fix: the watchdog also treats an active tool SUBPROCESS as activity — agy
+// spawns tools into its own process group, so any live descendant means "busy
+// running a tool", not "stuck". Background HTTP noise (quota/auth refresh) has
+// no subprocess, so it still can't defeat the idle timeout.
 const SOFT_TIMEOUT_MS = 720000;     // 12 min — extend past this only if agy is active
-const IDLE_TIMEOUT_MS = 300000;     // 5 min without any activity signal — kill
+const IDLE_TIMEOUT_MS = 480000;     // 8 min with no round, no stdout AND no live tool subprocess — kill
 const HARD_TIMEOUT_MS = 1800000;    // 30 min — absolute kill (authoritative)
 const AGY_PRINT_TIMEOUT = '35m';    // agy's own budget, kept above HARD
 const WATCHDOG_MS = 15000;          // adaptive-timeout check cadence
@@ -100,8 +109,9 @@ function summarizeAgyError(raw) {
 }
 
 // Live-tail agy's private glog file and report agent-loop activity. Each
-// "streamGenerateContent" line = one model round (the only reliable live
-// marker; tool executions are not logged). Raw file growth is NOT treated as
+// "streamGenerateContent" line = one model round (the reliable live marker in
+// the log; tool executions are not logged here — those are caught separately by
+// hasActiveToolChild in the watchdog). Raw file growth is NOT treated as
 // activity — glog writes periodic noise (quota refresh etc.) even when the
 // agent loop is stuck, and that must not defeat the idle timeout.
 // Returns a stop() function; safe if the file doesn't exist yet.
@@ -130,6 +140,32 @@ function watchAgyLog(logFile, onRound) {
         }
     }, LOG_POLL_MS);
     return () => clearInterval(timer);
+}
+
+// Is agy currently running a tool? agy spawns tool commands (shell scripts,
+// curl, ssh, xdg-open) as processes in its own process group (pgid == agy pid,
+// since it was spawned detached). A live descendant means agy is busy executing
+// a tool — legitimate activity that produces no glog "streamGenerateContent"
+// line and no stdout for minutes. We read /proc directly (no subprocess spawn):
+// field 5 of /proc/<pid>/stat is the process-group id; comm (field 2) may hold
+// spaces/parens, so we parse pgrp from just after the final ')'. Returns true if
+// any process other than agy itself shares agy's group.
+function hasActiveToolChild(pgid) {
+    let procs;
+    try { procs = fs.readdirSync('/proc'); } catch (e) { return false; }
+    for (const name of procs) {
+        if (!/^\d+$/.test(name)) continue;
+        const pid = parseInt(name, 10);
+        if (pid === pgid) continue;
+        let stat;
+        try { stat = fs.readFileSync(`/proc/${name}/stat`, 'utf8'); } catch (e) { continue; }
+        const rp = stat.lastIndexOf(')');
+        if (rp === -1) continue;
+        // after ') ' come: state(3) ppid(4) pgrp(5) ...
+        const fields = stat.slice(rp + 2).trim().split(/\s+/);
+        if (parseInt(fields[2], 10) === pgid) return true;
+    }
+    return false;
 }
 
 // Extract plain text from an OpenAI message `content` field, which may be a
@@ -355,6 +391,13 @@ const server = http.createServer((req, res) => {
                 const watchdog = setInterval(() => {
                     const now = Date.now();
                     const total = now - attemptStart;
+                    // A live tool subprocess counts as activity: agy is busy
+                    // executing a tool that emits no round line and no stdout.
+                    // Checked only once idle is building up, to keep the /proc
+                    // scan off the hot path.
+                    if (now - lastActivityAt >= WATCHDOG_MS && child.pid && hasActiveToolChild(child.pid)) {
+                        lastActivityAt = now;
+                    }
                     const idle = now - lastActivityAt;
                     if (total >= HARD_TIMEOUT_MS) {
                         timedOut = 'hard';
