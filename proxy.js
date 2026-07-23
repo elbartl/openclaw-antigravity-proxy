@@ -36,6 +36,21 @@ const PORT = 8000;
 const SOFT_TIMEOUT_MS = 720000;     // 12 min — extend past this only if agy is active
 const IDLE_TIMEOUT_MS = 900000;     // 15 min with no round, no stdout AND no live tool subprocess — long enough for one slow Pro round
 const HARD_TIMEOUT_MS = 1800000;    // 30 min — absolute kill (authoritative)
+// Loop guard: a model round resets the idle clock (it IS activity), so an agy
+// spinning rounds fast — e.g. asked for something it has no tool/permission for
+// — never trips IDLE and rides HARD to the full 30 min (then OpenClaw re-runs
+// the turn, doubling it). STUCK catches that: many model rounds, ZERO answer
+// tokens, and no live tool subprocess = looping without progress. A single slow
+// round can't trip it (needs several rounds); a legit long tool run can't
+// (hasActiveToolChild is true, and a blocked-on-tool agy emits no new rounds).
+const STUCK_NO_OUTPUT_MS = 420000;  // 7 min of rounds-but-no-stdout-and-no-tool => stuck, kill fast
+const STUCK_MIN_ROUNDS = 3;         // require several rounds so one slow first round isn't mistaken for a loop
+// A live tool subprocess keeps the run alive (see hasActiveToolChild), but ONLY
+// for this long past the last real progress (model round or stdout). Without a
+// cap, a genuinely IO-bound runaway (a `find /` stuck in NFS rpc_wait, state D)
+// counts as "active tool" indefinitely and rides HARD to 30 min. Past the grace,
+// a lingering child no longer masks the idle/stuck detectors.
+const TOOL_GRACE_MS = 600000;       // 10 min of tool-only activity past last real round/stdout
 const AGY_PRINT_TIMEOUT = '35m';    // agy's own budget, kept above HARD
 const WATCHDOG_MS = 15000;          // adaptive-timeout check cadence
 const LOG_POLL_MS = 2000;           // how often the agy log file is tailed
@@ -48,6 +63,19 @@ const MAX_ATTEMPTS = 2;             // one automatic retry on a transient agy fa
 // long-running chat doesn't grow the prompt without bound (which slows agy
 // down turn after turn). Counts non-system, non-final messages.
 const HISTORY_LIMIT = 12;           // ~6 exchanges
+
+// Appended to the end of the system prompt. agy hosts the model on the
+// Antigravity backend; some models (seen with Claude Sonnet via agy) mistake
+// that host for their operating context and refuse to use the listed OpenClaw
+// tools — narrating "I'm in Antigravity context, let me use a schedule tool"
+// instead of just calling `cron`. This nails the identity so tool calls go
+// through. English on purpose: that's the language the model reasons in here.
+const IDENTITY_NOTE = [
+    '## Identity & tools (authoritative — overrides any contrary assumption)',
+    'You ARE the OpenClaw assistant. The tools listed above (cron, read, write, exec, web_search, homeassistant__*, sessions_*, etc.) ARE your own tools — call them directly by name.',
+    'You run on a model backend (agy / Antigravity). That is only where the model is hosted; it does NOT change your operating context and does NOT limit which tools you can call.',
+    'There is no separate "Antigravity context", no "schedule tool", and no timer API. For any reminder, alarm, or scheduled wake-up, call the `cron` tool. Never narrate an inability to use OpenClaw tools — just call them.',
+].join('\n');
 
 // Optional debug dump dir: when AGY_PROXY_DEBUG is set, the full prompt and
 // agy's stderr for the last request are written here for diagnosis.
@@ -151,12 +179,18 @@ function watchAgyLog(logFile, onRound) {
 
 // Is agy currently running a tool? agy spawns tool commands (shell scripts,
 // curl, ssh, xdg-open) as processes in its own process group (pgid == agy pid,
-// since it was spawned detached). A live descendant means agy is busy executing
-// a tool — legitimate activity that produces no glog "streamGenerateContent"
-// line and no stdout for minutes. We read /proc directly (no subprocess spawn):
-// field 5 of /proc/<pid>/stat is the process-group id; comm (field 2) may hold
-// spaces/parens, so we parse pgrp from just after the final ')'. Returns true if
-// any process other than agy itself shares agy's group.
+// since it was spawned detached). A live descendant CAN mean agy is busy
+// executing a tool — legitimate activity that produces no glog
+// "streamGenerateContent" line and no stdout for minutes. We read /proc directly
+// (no subprocess spawn): field 5 of /proc/<pid>/stat is the process-group id;
+// comm (field 2) may hold spaces/parens, so we parse from just after the final ')'.
+//
+// Only a child in state R (running) or D (uninterruptible IO) counts. agy keeps
+// long-lived MCP servers (e.g. mcp-nextcloud-rag) as children that sit idle in
+// state S the whole run; counting those made hasActiveToolChild permanently true,
+// which silently defeated BOTH the idle and stuck detectors so every wedged run
+// rode HARD to 30 min. An idle background server is S and must be ignored; a
+// foreground tool doing work is R or D.
 function hasActiveToolChild(pgid) {
     let procs;
     try { procs = fs.readdirSync('/proc'); } catch (e) { return false; }
@@ -170,7 +204,9 @@ function hasActiveToolChild(pgid) {
         if (rp === -1) continue;
         // after ') ' come: state(3) ppid(4) pgrp(5) ...
         const fields = stat.slice(rp + 2).trim().split(/\s+/);
-        if (parseInt(fields[2], 10) === pgid) return true;
+        if (parseInt(fields[2], 10) !== pgid) continue;
+        const state = fields[0];
+        if (state === 'R' || state === 'D') return true; // busy; keep scanning past idle (S) children
     }
     return false;
 }
@@ -237,7 +273,7 @@ function buildPrompt(messages) {
 
     const sections = [];
     if (systemParts.length) {
-        sections.push('Instrukcje systemowe:\n' + systemParts.join('\n'));
+        sections.push('Instrukcje systemowe:\n' + systemParts.join('\n') + '\n\n' + IDENTITY_NOTE);
     }
     if (cappedHistory.length) {
         sections.push('Kontekst poprzednich wiadomości:\n' + cappedHistory.join('\n'));
@@ -352,11 +388,15 @@ const server = http.createServer((req, res) => {
             function runAgy(onChunk, cb, onStatus) {
                 let out = "";
                 let errOut = "";
-                let timedOut = false;   // false | 'idle' | 'hard'
+                let timedOut = false;   // false | 'idle' | 'hard' | 'stuck'
                 let spawnErr = null;
                 let done = false;
                 let rounds = 0;
                 let lastActivityAt = Date.now();
+                // Real progress = a model round or a stdout byte. Distinct from
+                // lastActivityAt (which a live tool child also refreshes): a tool
+                // child only keeps the run alive for TOOL_GRACE_MS past this.
+                let lastRealActivityAt = Date.now();
                 const attemptStart = Date.now();
 
                 // Private glog file per attempt: agy >= 1.1.0 reports backend
@@ -386,6 +426,7 @@ const server = http.createServer((req, res) => {
                 const stopLogWatch = watchAgyLog(logFile, () => {
                     rounds++;
                     lastActivityAt = Date.now();
+                    lastRealActivityAt = lastActivityAt;
                     if (onStatus) onStatus({ type: 'round', rounds });
                 });
 
@@ -398,15 +439,26 @@ const server = http.createServer((req, res) => {
                 const watchdog = setInterval(() => {
                     const now = Date.now();
                     const total = now - attemptStart;
-                    // A live tool subprocess counts as activity: agy is busy
-                    // executing a tool that emits no round line and no stdout.
-                    // Checked only once idle is building up, to keep the /proc
-                    // scan off the hot path.
-                    if (now - lastActivityAt >= WATCHDOG_MS && child.pid && hasActiveToolChild(child.pid)) {
+                    // A live tool subprocess (R/D state) counts as activity: agy
+                    // is busy executing a tool that emits no round line and no
+                    // stdout — BUT only within TOOL_GRACE_MS past the last real
+                    // progress, so a wedged/runaway child (e.g. find stuck in NFS)
+                    // can't mask the detectors forever. Computed once and reused
+                    // by both the idle refresh and the stuck check.
+                    const toolActive = (now - lastRealActivityAt < TOOL_GRACE_MS)
+                        && child.pid && hasActiveToolChild(child.pid);
+                    if (now - lastActivityAt >= WATCHDOG_MS && toolActive) {
                         lastActivityAt = now;
                     }
                     const idle = now - lastActivityAt;
-                    if (total >= HARD_TIMEOUT_MS) {
+                    if (!firstByteAt && rounds >= STUCK_MIN_ROUNDS && total >= STUCK_NO_OUTPUT_MS
+                        && !toolActive) {
+                        timedOut = 'stuck';
+                        console.log(`⏱ agy STUCK po ${elapsed()}s — ${rounds} rund modelu, 0 tokenów odpowiedzi, brak żywego narzędzia; pętla bez postępu, zabijam`);
+                        clearInterval(watchdog);
+                        killTree(child);
+                        setTimeout(() => finish(-1), 5000).unref();
+                    } else if (total >= HARD_TIMEOUT_MS) {
                         timedOut = 'hard';
                         console.log(`⏱ agy HARD timeout (${HARD_TIMEOUT_MS / 60000} min) po ${elapsed()}s — zabijam proces (rund: ${rounds})`);
                         clearInterval(watchdog);
@@ -450,6 +502,7 @@ const server = http.createServer((req, res) => {
                 child.stdout.on('data', (c) => {
                     const s = c.toString();
                     lastActivityAt = Date.now();
+                    lastRealActivityAt = lastActivityAt;
                     if (!firstByteAt) {
                         firstByteAt = Date.now();
                         console.log(`  ↳ pierwszy token po ${elapsed()}s`);
@@ -561,7 +614,13 @@ const server = http.createServer((req, res) => {
                         (result) => {
                             if (clientGone) { clearInterval(heartbeat); return; }
                             const { code, errOut, timedOut, spawnErr, logErr, rounds } = result;
-                            const transientFail = !spawnErr && !timedOut && code !== 0;
+                            // IDLE is retried like a transient failure: it fires on a
+                            // genuinely stalled model call (network hang), and retrying
+                            // inside proxy — once, only if nothing reached the client yet —
+                            // beats surfacing an error and letting OpenClaw re-run the whole
+                            // turn externally (which doubled the wait, see STUCK comment
+                            // above). HARD and STUCK stay authoritative/non-retried.
+                            const transientFail = !spawnErr && (!timedOut || timedOut === 'idle') && code !== 0;
                             // agy >= 1.1.0 error signature: clean exit, zero
                             // output. The real cause sits in logErr. Not
                             // retried: the dominant case (quota 429) won't
@@ -569,7 +628,7 @@ const server = http.createServer((req, res) => {
                             const emptyFail = !spawnErr && !timedOut && code === 0 && !sentAny;
 
                             if (transientFail && !sentAny && n < MAX_ATTEMPTS) {
-                                console.log(`↻ agy próba ${n} nieudana (kod ${code}) — ponawiam. stderr: ${errOut.trim().slice(0, 200)}`);
+                                console.log(`↻ agy próba ${n} nieudana (kod ${code}${timedOut ? `, timedOut=${timedOut}` : ''}) — ponawiam. stderr: ${errOut.trim().slice(0, 200)}`);
                                 return streamAttempt(n + 1);
                             }
 
@@ -577,6 +636,8 @@ const server = http.createServer((req, res) => {
                             if (spawnErr || timedOut || code !== 0 || emptyFail) {
                                 const msg = spawnErr
                                     ? `Nie udało się uruchomić agy: ${spawnErr.message}`
+                                    : timedOut === 'stuck'
+                                        ? `agy utknął w pętli bez postępu — ${rounds} rund do modelu i ani jednej odpowiedzi przez ${STUCK_NO_OUTPUT_MS / 60000} min. Zwykle znaczy brak potrzebnego narzędzia lub uprawnień do zadania. Przerwane.`
                                     : timedOut === 'idle'
                                         ? `agy przerwany — brak aktywności przez ${IDLE_TIMEOUT_MS / 60000} min (po ${elapsed()}s, rund: ${rounds})`
                                         : timedOut === 'hard'
@@ -604,12 +665,14 @@ const server = http.createServer((req, res) => {
                     runAgy(null, (result) => {
                         if (clientGone) return;
                         const { code, out, errOut, timedOut, spawnErr, logErr, rounds } = result;
-                        const transientFail = !spawnErr && !timedOut && code !== 0;
+                        // See streaming path above: IDLE is retried in-proxy (buffered mode
+                        // never sent anything to the client mid-flight, so it's always safe).
+                        const transientFail = !spawnErr && (!timedOut || timedOut === 'idle') && code !== 0;
                         // Same empty-output error signature as in stream mode.
                         const emptyFail = !spawnErr && !timedOut && code === 0 && !out.trim();
 
                         if (transientFail && n < MAX_ATTEMPTS) {
-                            console.log(`↻ agy próba ${n} nieudana (kod ${code}) — ponawiam. stderr: ${errOut.trim().slice(0, 200)}`);
+                            console.log(`↻ agy próba ${n} nieudana (kod ${code}${timedOut ? `, timedOut=${timedOut}` : ''}) — ponawiam. stderr: ${errOut.trim().slice(0, 200)}`);
                             return bufAttempt(n + 1);
                         }
 
@@ -618,6 +681,8 @@ const server = http.createServer((req, res) => {
                         if (spawnErr || timedOut || code !== 0 || emptyFail) {
                             const msg = spawnErr
                                 ? `Nie udało się uruchomić agy: ${spawnErr.message}`
+                                : timedOut === 'stuck'
+                                    ? `agy utknął w pętli bez postępu — ${rounds} rund do modelu i ani jednej odpowiedzi przez ${STUCK_NO_OUTPUT_MS / 60000} min. Zwykle znaczy brak potrzebnego narzędzia lub uprawnień do zadania. Przerwane.`
                                 : timedOut === 'idle'
                                     ? `agy przerwany — brak aktywności przez ${IDLE_TIMEOUT_MS / 60000} min (po ${elapsed()}s, rund: ${rounds})`
                                     : timedOut === 'hard'
