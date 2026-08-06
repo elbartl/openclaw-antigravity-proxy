@@ -59,6 +59,80 @@ const STATUS_MIN_GAP_MS = 60000;    // min spacing of visible round-update statu
 const PROGRESS_MAX_GAP_MS = 180000; // max spacing of ANY visible tick — kept under OpenClaw's ~400s stall/abort so a silent long tool never looks stalled to the client
 const MAX_ATTEMPTS = 2;             // one automatic retry on a transient agy failure
 
+// ---- Concurrency limiter -------------------------------------------------
+// Host is a Raspberry Pi; each agy spawn is hundreds of MB plus its own MCP
+// child processes. Without a cap, OpenClaw multiagent (sessions_spawn) can fire
+// several sessions at once and OOM the host or crash agy auth. Semaphore +
+// bounded FIFO queue: at most MAX_CONCURRENT agy run at once, up to MAX_QUEUE
+// more wait, anything past that is rejected fast (429 / visible ⚠️) instead of
+// piling on. A waiter that outlives QUEUE_TIMEOUT_MS is failed, not left hanging.
+const MAX_CONCURRENT   = parseInt(process.env.AGY_MAX_CONCURRENT   || '2', 10);
+const MAX_QUEUE        = parseInt(process.env.AGY_MAX_QUEUE        || '4', 10);
+const QUEUE_TIMEOUT_MS = parseInt(process.env.AGY_QUEUE_TIMEOUT_MS || '600000', 10); // 10 min
+
+// Async counting semaphore with a bounded waiter queue. A "slot" is one unit of
+// `active`. acquire() either hands a slot out immediately, queues the caller, or
+// refuses (queue full). The slot count is conserved on hand-off: when a holder
+// releases, the freed slot is transferred straight to the next live waiter
+// (active stays put) rather than decremented-then-reincremented. release() is
+// created only at the moment a slot is actually granted, so a waiter that never
+// gets promoted has no release to mis-fire. Every release is idempotent.
+const sem = {
+    max: MAX_CONCURRENT,
+    maxQueue: MAX_QUEUE,
+    active: 0,
+    waiters: [],
+    get queued() { return this.waiters.length; },
+    _mkRelease() {
+        let done = false;
+        return () => { if (done) return; done = true; this._next(); };
+    },
+    // { ok:true, slot:Promise<release> } — slot resolves now (free) or later
+    // (queued). { ok:false } — queue full, caller must reject the request.
+    acquire() {
+        if (this.active < this.max) {
+            this.active++;
+            return { ok: true, slot: Promise.resolve(this._mkRelease()) };
+        }
+        if (this.waiters.length >= this.maxQueue) return { ok: false };
+        const waiter = { cancelled: false, enqueuedAt: Date.now() };
+        waiter.slot = new Promise((resolve, reject) => {
+            waiter._promote = () => resolve(this._mkRelease());
+            waiter.timer = setTimeout(() => {
+                this._removeWaiter(waiter);
+                reject(new Error('queue_timeout'));
+            }, QUEUE_TIMEOUT_MS);
+            waiter._reject = reject;
+        });
+        this.waiters.push(waiter);
+        return { ok: true, slot: waiter.slot, waiter };
+    },
+    _next() {
+        while (this.waiters.length) {
+            const w = this.waiters.shift();
+            clearTimeout(w.timer);
+            if (w.cancelled) continue;      // disconnected while queued — skip
+            w._promote();                    // slot transferred: active unchanged
+            return;
+        }
+        this.active--;                       // nobody waiting — slot goes idle
+    },
+    _removeWaiter(w) {
+        const i = this.waiters.indexOf(w);
+        if (i >= 0) this.waiters.splice(i, 1);
+    },
+    position(w) { return this.waiters.indexOf(w); },
+    // Client disconnected while still queued: drop the waiter (it holds no slot)
+    // so a freed slot is never handed to a dead connection.
+    cancelWaiter(w) {
+        if (!w || w.cancelled) return;
+        w.cancelled = true;
+        clearTimeout(w.timer);
+        this._removeWaiter(w);
+        try { w._reject(new Error('client_gone')); } catch (e) {}
+    },
+};
+
 // Keep the system prompt in full but cap raw conversation history so a
 // long-running chat doesn't grow the prompt without bound (which slows agy
 // down turn after turn). Counts non-system, non-final messages.
@@ -102,18 +176,48 @@ const MODEL_MAP = {
     "gpt-oss":           "GPT-OSS 120B (Medium)",
 };
 
-// Resolve the requested OpenAI model id to an agy model name.
+// ---- Permission roles ----------------------------------------------------
+// agy calls Home Assistant (and Nextcloud, etc.) through its OWN mcp_config,
+// never through OpenClaw's tool layer, so OpenClaw's tools.deny can't reach it.
+// The only real control point is agy's own config, selected here by HOME:
+//   full — the process HOME (production profile), --dangerously-skip-permissions
+//          auto-approves every tool (current behaviour, watchdog path).
+//   ro   — an isolated HOME (~/.agy-profiles/ro) whose settings.json has NO
+//          skip-permissions and a narrow permissions.allow of read-only tools.
+//          Verified 2026-08-06 (agy 1.1.10): a tool NOT on the allowlist is
+//          auto-DENIED in --print mode (clean, ~9s, no hang), reads still work,
+//          and matching is EXACT tool name (no substring, no glob). See
+//          PLAN_ACL_LIMITS.md §7. Optional --mode plan (AGY_RO_PLAN=1) adds an
+//          orthogonal write-block layer that still permits reads.
+// The role is picked by a `-ro` suffix on the model id (see resolveAgyModel):
+// registering `*-ro` ids in openclaw.json makes OpenClaw's own model allowlist
+// the gate for which agent may reach the full role at all.
+const ROLES = {
+    full: { home: null, args: ['--dangerously-skip-permissions'] },
+    ro:   {
+        home: process.env.AGY_RO_HOME || path.join(os.homedir(), '.agy-profiles/ro'),
+        args: process.env.AGY_RO_PLAN === '1' ? ['--mode', 'plan'] : [],
+    },
+};
+const DEFAULT_ROLE = (process.env.AGY_DEFAULT_ROLE === 'ro') ? 'ro' : 'full'; // backward compatible
+// Live per-role slot occupancy, surfaced by /healthz.
+const roleActive = { full: 0, ro: 0 };
+
+// Resolve the requested OpenAI model id to an agy model name + permission role.
 // Accepts our short ids, a "provider/id" form, or an exact agy model name.
-// "antigravity" / empty -> the AGY_MODEL default (may be null = agy default).
-// Unknown ids are an ERROR (not a silent fallback): a typo like "gmeini-flash"
-// used to silently route to the default model, which made failures undebuggable.
+// A trailing `-ro` on the id selects the read-only role; the base id is then
+// resolved as usual. "antigravity" / empty -> the AGY_MODEL default (may be
+// null = agy default). Unknown ids are an ERROR (not a silent fallback): a typo
+// like "gmeini-flash" used to silently route to the default, undebuggable.
 function resolveAgyModel(requested) {
-    if (!requested) return { model: AGY_MODEL };
-    const id = requested.includes('/') ? requested.split('/').pop() : requested;
-    if (id === 'antigravity') return { model: AGY_MODEL };
-    if (MODEL_MAP[id]) return { model: MODEL_MAP[id] };
-    if (Object.values(MODEL_MAP).includes(requested)) return { model: requested }; // exact agy name
-    return { error: `Nieznany model "${requested}". Dostępne id: antigravity, ${Object.keys(MODEL_MAP).join(', ')}` };
+    if (!requested) return { model: AGY_MODEL, role: DEFAULT_ROLE };
+    let id = requested.includes('/') ? requested.split('/').pop() : requested;
+    let role = DEFAULT_ROLE;
+    if (id.endsWith('-ro')) { role = 'ro'; id = id.slice(0, -3); }
+    if (id === 'antigravity') return { model: AGY_MODEL, role };
+    if (MODEL_MAP[id]) return { model: MODEL_MAP[id], role };
+    if (Object.values(MODEL_MAP).includes(requested)) return { model: requested, role }; // exact agy name
+    return { error: `Nieznany model "${requested}". Dostępne id: antigravity, ${Object.keys(MODEL_MAP).join(', ')} (sufiks -ro = rola read-only)` };
 }
 
 // agy >= 1.1.0 swallows backend errors in --print mode: exit code 0, empty
@@ -290,10 +394,30 @@ const server = http.createServer((req, res) => {
     // Models endpoint: advertise the default plus every selectable id.
     if (req.url === '/v1/models' || req.url === '/models') {
         res.setHeader('Content-Type', 'application/json');
-        const ids = ["antigravity", ...Object.keys(MODEL_MAP)];
+        const baseIds = ["antigravity", ...Object.keys(MODEL_MAP)];
+        // Advertise each id in both roles: bare = full (or AGY_DEFAULT_ROLE),
+        // `-ro` = read-only. Register the ones you want selectable in openclaw.json.
+        const ids = [...baseIds, ...baseIds.map(id => `${id}-ro`)];
         res.end(JSON.stringify({
             object: "list",
             data: ids.map(id => ({ id, object: "model", owned_by: "local" }))
+        }));
+        return;
+    }
+
+    // Liveness/concurrency probe. Consumed by the hourly ha_watchdog so it can
+    // skip a proxy that is already saturated instead of piling another spawn on.
+    if (req.url === '/healthz') {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+            active: sem.active,
+            queued: sem.queued,
+            maxConcurrent: MAX_CONCURRENT,
+            maxQueue: MAX_QUEUE,
+            roles: { full: roleActive.full, ro: roleActive.ro },
+            roHome: ROLES.ro.home,
+            defaultRole: DEFAULT_ROLE,
+            uptimeSec: Math.round(process.uptime()),
         }));
         return;
     }
@@ -342,6 +466,8 @@ const server = http.createServer((req, res) => {
                 return;
             }
             const agyModel = resolved.model;
+            const role = resolved.role || DEFAULT_ROLE;
+            const roleCfg = ROLES[role] || ROLES.full;
 
             if (!messages.length) {
                 res.statusCode = 400;
@@ -353,7 +479,7 @@ const server = http.createServer((req, res) => {
             const prompt = buildPrompt(messages);
             const startedAt = Date.now();
             let firstByteAt = 0;
-            console.log(`→ agy | stream=${isStream} | model=${modelName} → agy:${agyModel || '(domyślny)'} | prompt=${prompt.length} zn. | "${prompt.substring(0, 80).replace(/\n/g, ' ')}..."`);
+            console.log(`→ agy | stream=${isStream} | rola=${role} | model=${modelName} → agy:${agyModel || '(domyślny)'} | prompt=${prompt.length} zn. | "${prompt.substring(0, 80).replace(/\n/g, ' ')}..."`);
 
             if (DEBUG_DIR) {
                 try { fs.writeFileSync(path.join(DEBUG_DIR, 'last_prompt.txt'), prompt); } catch (e) {}
@@ -363,6 +489,14 @@ const server = http.createServer((req, res) => {
             // attempt is currently running.
             let currentChild = null;
             let clientGone = false;
+            // Concurrency slot: `queueWaiter` is set only while this request is
+            // parked in the queue; `heldRelease` is set only once it actually
+            // holds a slot. freeSlot() releases exactly once (idempotent) and is
+            // called on every terminal path — success, error, timeout, disconnect.
+            let queueWaiter = null;
+            let heldRelease = null;
+            const holdSlot = (release) => { heldRelease = release; roleActive[role]++; };
+            const freeSlot = () => { if (heldRelease) { const r = heldRelease; heldRelease = null; roleActive[role]--; r(); } };
             // Kill agy together with its whole process group (detached spawn):
             // grandchildren (tool commands, xdg-open/browser) would otherwise
             // survive and keep the stdio pipes open forever.
@@ -376,6 +510,11 @@ const server = http.createServer((req, res) => {
                 if (currentChild && currentChild.exitCode === null && currentChild.signalCode === null) {
                     killTree(currentChild);
                 }
+                // Queued but never started: drop the waiter so its slot isn't
+                // handed to a dead connection. Holding a slot: free it after the
+                // kill above so a waiter can take over.
+                if (queueWaiter) { sem.cancelWaiter(queueWaiter); queueWaiter = null; }
+                freeSlot();
             });
 
             const elapsed = () => ((Date.now() - startedAt) / 1000).toFixed(2);
@@ -408,15 +547,20 @@ const server = http.createServer((req, res) => {
                 // consumed as the prompt itself). spawn() passes argv without a
                 // shell, so no escaping issues; Linux per-arg limit (MAX_ARG_STRLEN)
                 // is far above our prompt sizes.
-                const agyArgs = ['--dangerously-skip-permissions', '--print-timeout', AGY_PRINT_TIMEOUT, '--log-file', logFile];
+                // Role decides the permission posture: full = skip-permissions
+                // (auto-approve), ro = no skip + an isolated HOME whose
+                // settings.json allowlist is authoritative (see ROLES).
+                const agyArgs = [...roleCfg.args, '--print-timeout', AGY_PRINT_TIMEOUT, '--log-file', logFile];
                 if (agyModel) agyArgs.push('--model', agyModel);
                 agyArgs.push('--print', prompt);
+                const spawnEnv = { ...process.env, NO_COLOR: '1' };
+                if (roleCfg.home) spawnEnv.HOME = roleCfg.home;   // isolated RO profile
                 // detached: own process group, so a timeout kill also reaps
                 // grandchildren agy may spawn (tools, xdg-open, browsers).
                 const child = spawn('agy', agyArgs, {
                     stdio: ['ignore', 'pipe', 'pipe'],
                     detached: true,
-                    env: { ...process.env, NO_COLOR: '1' }
+                    env: spawnEnv
                 });
                 currentChild = child;
 
@@ -577,6 +721,18 @@ const server = http.createServer((req, res) => {
 
                 const heartbeat = setInterval(() => {
                     if (res.writableEnded || sentAny) return;
+                    // Still parked in the queue: keep the client's stall detector
+                    // fed (it aborts after ~400s of no stream progress) with a
+                    // rationed visible position tick, invisible keepalives between.
+                    if (queueWaiter) {
+                        if (!lastVisibleAt || Date.now() - lastVisibleAt >= PROGRESS_MAX_GAP_MS) {
+                            showStatus(`⏳ [kolejka] czekam na wolny slot agy (pozycja ${sem.position(queueWaiter) + 1})…\n`);
+                        } else {
+                            sendDelta(null);
+                            res.write(`: queued ${elapsed()}s\n\n`);
+                        }
+                        return;
+                    }
                     if (!lastVisibleAt) {
                         showStatus('⏳ Pracuję nad zadaniem, może potrwać kilka minut…\n');
                     } else if (Date.now() - lastVisibleAt >= PROGRESS_MAX_GAP_MS) {
@@ -612,7 +768,7 @@ const server = http.createServer((req, res) => {
                     runAgy(
                         (chunk) => { sentAny = true; sendDelta(chunk); },
                         (result) => {
-                            if (clientGone) { clearInterval(heartbeat); return; }
+                            if (clientGone) { clearInterval(heartbeat); freeSlot(); return; }
                             const { code, errOut, timedOut, spawnErr, logErr, rounds } = result;
                             // IDLE is retried like a transient failure: it fires on a
                             // genuinely stalled model call (network hang), and retrying
@@ -655,15 +811,47 @@ const server = http.createServer((req, res) => {
                             res.write('data: [DONE]\n\n');
                             res.end();
                             finalLog(code, rounds);
+                            freeSlot();
                         },
                         onStatus
                     );
                 };
-                streamAttempt(1);
+
+                // Slot acquisition (ordering per plan §3.3): SSE headers and the
+                // heartbeat are already live above, so the client keeps seeing
+                // progress even while we sit in the queue. Only now do we take a
+                // slot. Queue full → immediate visible refusal. Granted (now or
+                // after a wait) → start the attempt. Queue timeout / disconnect
+                // while waiting → clean close, no slot held.
+                const acq = sem.acquire();
+                if (!acq.ok) {
+                    clearInterval(heartbeat);
+                    console.error(`✗ agy_busy — ${sem.active} aktywnych, ${sem.queued} w kolejce (limit ${MAX_CONCURRENT}+${MAX_QUEUE})`);
+                    sendDelta(`⚠️ [proxy] Wszystkie sloty agy zajęte (${sem.active} aktywnych, ${sem.queued} w kolejce) — spróbuj za chwilę.`, 'stop');
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                    return;
+                }
+                queueWaiter = acq.waiter || null;
+                acq.slot.then((release) => {
+                    queueWaiter = null;
+                    if (clientGone) { release(); clearInterval(heartbeat); return; }
+                    holdSlot(release);
+                    streamAttempt(1);
+                }).catch(() => {
+                    // queue_timeout or client_gone: no slot was ever held.
+                    queueWaiter = null;
+                    clearInterval(heartbeat);
+                    if (!clientGone && !res.writableEnded) {
+                        sendDelta(`\n⚠️ [proxy] Przekroczono limit oczekiwania w kolejce (${Math.round(QUEUE_TIMEOUT_MS / 60000)} min) — spróbuj ponownie.`, 'stop');
+                        res.write('data: [DONE]\n\n');
+                        res.end();
+                    }
+                });
             } else {
                 const bufAttempt = (n) => {
                     runAgy(null, (result) => {
-                        if (clientGone) return;
+                        if (clientGone) { freeSlot(); return; }
                         const { code, out, errOut, timedOut, spawnErr, logErr, rounds } = result;
                         // See streaming path above: IDLE is retried in-proxy (buffered mode
                         // never sent anything to the client mid-flight, so it's always safe).
@@ -697,6 +885,7 @@ const server = http.createServer((req, res) => {
                             res.setHeader('Content-Type', 'application/json');
                             res.end(JSON.stringify({ error: { message: full, type: 'agy_error', code: emptyFail ? 'empty_response' : 'agy_failed' } }));
                             finalLog(code, rounds);
+                            freeSlot();
                             return;
                         }
 
@@ -710,9 +899,37 @@ const server = http.createServer((req, res) => {
                             choices: [{ message: { role: "assistant", content: out.trim() }, finish_reason: "stop", index: 0 }]
                         }));
                         finalLog(code, rounds);
+                        freeSlot();
                     });
                 };
-                bufAttempt(1);
+
+                // Buffered path: no stream to keep alive, so just take a slot.
+                // Queue full → 429 with Retry-After now. Granted → run. Queue
+                // timeout / disconnect while waiting → error out / drop quietly.
+                const acq = sem.acquire();
+                if (!acq.ok) {
+                    console.error(`✗ agy_busy (buffered) — ${sem.active} aktywnych, ${sem.queued} w kolejce`);
+                    res.statusCode = 429;
+                    res.setHeader('Retry-After', '60');
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify({ error: { message: `Wszystkie sloty agy zajęte (${sem.active} aktywnych, ${sem.queued} w kolejce)`, type: 'agy_error', code: 'agy_busy' } }));
+                    return;
+                }
+                queueWaiter = acq.waiter || null;
+                acq.slot.then((release) => {
+                    queueWaiter = null;
+                    if (clientGone) { release(); return; }
+                    holdSlot(release);
+                    bufAttempt(1);
+                }).catch(() => {
+                    queueWaiter = null;
+                    if (!clientGone && !res.writableEnded) {
+                        res.statusCode = 503;
+                        res.setHeader('Retry-After', '60');
+                        res.setHeader('Content-Type', 'application/json');
+                        res.end(JSON.stringify({ error: { message: `Przekroczono limit oczekiwania w kolejce (${Math.round(QUEUE_TIMEOUT_MS / 60000)} min)`, type: 'agy_error', code: 'queue_timeout' } }));
+                    }
+                });
             }
         });
     } else {

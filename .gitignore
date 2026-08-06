@@ -17,3 +17,6 @@ last_stderr.txt
 __pycache__/
 *.pyc
 .venv/
+
+# home-lab implementation plan (private paths, HA entities, IP) — like PROXY.md
+PLAN_ACL_LIMITS.md
