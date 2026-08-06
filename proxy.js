@@ -4,7 +4,7 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const PORT = 8000;
+const PORT = parseInt(process.env.PROXY_PORT || '8000', 10);
 // agy print mode may run web searches and tools for complex queries, which
 // legitimately takes minutes. The proxy owns the timeout; agy gets a longer
 // internal --print-timeout (AGY_PRINT_TIMEOUT) so it never self-terminates
@@ -58,6 +58,13 @@ const HEARTBEAT_MS = 15000;         // visible progress-tick cadence during sile
 const STATUS_MIN_GAP_MS = 60000;    // min spacing of visible round-update status lines (append-only UI)
 const PROGRESS_MAX_GAP_MS = 180000; // max spacing of ANY visible tick — kept under OpenClaw's ~400s stall/abort so a silent long tool never looks stalled to the client
 const MAX_ATTEMPTS = 2;             // one automatic retry on a transient agy failure
+// On ANY error termination (timeout, spawn error, non-zero exit, empty output,
+// permission denial) agy's private glog is preserved in tmpdir instead of
+// deleted — it's the only record of what the failed run actually touched (which
+// file/tool a denial hit). Prefix encodes the cause: agy-timeout-/agy-denied-/
+// agy-fail-. Saved glogs older than this are swept on startup so /tmp can't grow
+// without bound.
+const GLOG_RETENTION_DAYS = parseInt(process.env.AGY_GLOG_RETENTION_DAYS || '7', 10);
 
 // ---- Concurrency limiter -------------------------------------------------
 // Host is a Raspberry Pi; each agy spawn is hundreds of MB plus its own MCP
@@ -245,6 +252,36 @@ function summarizeAgyError(raw) {
         return `limit (quota) modelu wyczerpany — kod 429${reset ? `, reset za ${reset[1]}` : ''}`;
     }
     return raw.length > 300 ? raw.slice(0, 300) + '…' : raw;
+}
+
+// Classify a permission denial from a finished run. Two signals, both in text
+// the caller already has:
+//   1. errOut/stdout carry agy's headless auto-deny notice — the reliable
+//      DETECTOR: `a tool required the "<class>" permission that headless mode
+//      cannot prompt for`.
+//   2. The glog (proxy's --print run puts --print last, so --log-file IS
+//      populated) carries the precise line, with class AND target together:
+//      `permission_manager.go:954] permission check failed for <class> "<target>"`.
+// Prefer (2) for a self-consistent class+target; fall back to (1)'s class with a
+// null target. Returns {permClass, target} or null if this was not a denial.
+function classifyDenial(logText, errOut, out) {
+    const glog = (logText || '').match(/permission check failed for (\S+)\s+"([^"]+)"/);
+    if (glog) return { permClass: glog[1], target: glog[2] };
+    const notice = `${errOut || ''}\n${out || ''}\n${logText || ''}`
+        .match(/required the "?(mcp|command|read_file)"? permission that headless mode cannot prompt for/);
+    if (notice) return { permClass: notice[1], target: null };
+    return null;
+}
+
+// User-facing message for a permission denial. Always names the role and the
+// profile's settings.json so the operator knows exactly which allowlist to edit;
+// names the concrete target when it could be recovered from agy's log.
+function buildPermissionError(role, permClass, target, settingsPath) {
+    const where = settingsPath ? ` Dodaj regułę w ${settingsPath}.` : '';
+    if (target) {
+        return `agy odmówił uprawnienia: narzędzie klasy '${permClass}' na cel "${target}" nie jest w allowliście roli '${role}'.${where}`;
+    }
+    return `agy odmówił uprawnienia klasy '${permClass}' (rola '${role}'). Cel nieustalony z logu — dodaj regułę '${permClass}(<cel>)' w allowliście.${where}`;
 }
 
 // Live-tail agy's private glog file and report agent-loop activity. Each
@@ -630,17 +667,39 @@ const server = http.createServer((req, res) => {
                     let logText = '';
                     try { logText = fs.readFileSync(logFile, 'utf8'); } catch (e) {}
                     try { logErr = extractAgyError(logText); } catch (e) {}
-                    // On a timeout kill, agy looked "stuck" — preserve its glog and
-                    // dump the tail so we can see what it was actually doing during
-                    // the silent window (waiting on a model round vs a hung tool).
-                    if (timedOut && logText) {
-                        const saved = path.join(os.tmpdir(), `agy-stuck-${process.pid}-${Date.now()}.log`);
-                        try { fs.writeFileSync(saved, logText); } catch (e) {}
+                    // Permission denial is its own failure mode: agy auto-denies a
+                    // tool whose permission class is not on the role's allowlist.
+                    // classifyDenial gets the class (+ target, when the glog logged
+                    // it) from text we already hold. settingsPath points the
+                    // operator at the exact allowlist to edit for this role.
+                    const denial = classifyDenial(logText, errOut, out);
+                    const permissionClass = denial ? denial.permClass : null;
+                    let permissionTarget = null, settingsPath = null;
+                    if (denial) {
+                        permissionTarget = denial.target;
+                        const agyHome = (roleCfg && roleCfg.home) || process.env.HOME || os.homedir();
+                        settingsPath = path.join(agyHome, '.gemini/antigravity-cli/settings.json');
+                    }
+                    // Preserve the glog on ANY error termination — not just timeouts.
+                    // It is the only record of which file/tool the failed run
+                    // touched. A success (clean exit WITH real output) is deleted as
+                    // before. Prefix encodes the cause for later triage.
+                    const hadOutput = !!firstByteAt;
+                    let errKind = null;
+                    if (timedOut)               errKind = 'timeout';
+                    else if (spawnErr)          errKind = 'fail';
+                    else if (permissionClass)   errKind = 'denied';
+                    else if (code !== 0)        errKind = 'fail';
+                    else if (!hadOutput)        errKind = 'fail'; // clean exit, empty output
+                    let savedGlog = null;
+                    if (errKind && logText) {
+                        savedGlog = path.join(os.tmpdir(), `agy-${errKind}-${process.pid}-${Date.now()}.log`);
+                        try { fs.writeFileSync(savedGlog, logText); } catch (e) { savedGlog = null; }
                         const tail = logText.trimEnd().split('\n').slice(-25).join('\n');
-                        console.log(`⛏ agy ${timedOut}-timeout glog zachowany: ${saved}\n----- ogon glog -----\n${tail}\n----- koniec -----`);
+                        console.log(`⛏ agy ${errKind} glog zachowany: ${savedGlog}\n----- ogon glog -----\n${tail}\n----- koniec -----`);
                     }
                     try { fs.unlinkSync(logFile); } catch (e) {}
-                    cb({ code, out, errOut, timedOut, spawnErr, logErr, rounds });
+                    cb({ code, out, errOut, timedOut, spawnErr, logErr, rounds, permissionClass, permissionTarget, settingsPath, savedGlog });
                 };
 
                 child.stdout.on('data', (c) => {
@@ -769,19 +828,27 @@ const server = http.createServer((req, res) => {
                         (chunk) => { sentAny = true; sendDelta(chunk); },
                         (result) => {
                             if (clientGone) { clearInterval(heartbeat); freeSlot(); return; }
-                            const { code, errOut, timedOut, spawnErr, logErr, rounds } = result;
+                            const { code, errOut, timedOut, spawnErr, logErr, rounds, permissionClass, permissionTarget, settingsPath } = result;
+                            // Permission denial: a distinct, DETERMINISTIC failure —
+                            // agy auto-denied a tool not on the role's allowlist.
+                            // Never retried (a retry re-denies, wasting a spawn), and
+                            // surfaced as an ERROR event, not a content delta: a
+                            // content delta is exactly what made OpenClaw read the
+                            // failed run as a success.
+                            const permissionDenied = !!permissionClass && !sentAny;
                             // IDLE is retried like a transient failure: it fires on a
                             // genuinely stalled model call (network hang), and retrying
                             // inside proxy — once, only if nothing reached the client yet —
                             // beats surfacing an error and letting OpenClaw re-run the whole
                             // turn externally (which doubled the wait, see STUCK comment
                             // above). HARD and STUCK stay authoritative/non-retried.
-                            const transientFail = !spawnErr && (!timedOut || timedOut === 'idle') && code !== 0;
+                            // Explicitly excludes a denial (code is 0 there anyway).
+                            const transientFail = !spawnErr && !permissionDenied && (!timedOut || timedOut === 'idle') && code !== 0;
                             // agy >= 1.1.0 error signature: clean exit, zero
                             // output. The real cause sits in logErr. Not
                             // retried: the dominant case (quota 429) won't
                             // clear on retry and OpenClaw retries once anyway.
-                            const emptyFail = !spawnErr && !timedOut && code === 0 && !sentAny;
+                            const emptyFail = !spawnErr && !permissionDenied && !timedOut && code === 0 && !sentAny;
 
                             if (transientFail && !sentAny && n < MAX_ATTEMPTS) {
                                 console.log(`↻ agy próba ${n} nieudana (kod ${code}${timedOut ? `, timedOut=${timedOut}` : ''}) — ponawiam. stderr: ${errOut.trim().slice(0, 200)}`);
@@ -789,6 +856,21 @@ const server = http.createServer((req, res) => {
                             }
 
                             clearInterval(heartbeat);
+                            if (permissionDenied) {
+                                const full = buildPermissionError(role, permissionClass, permissionTarget, settingsPath);
+                                console.error(`✗ [odmowa uprawnienia] ${full}`);
+                                // OpenAI-style error event — NOT a content delta, and
+                                // NOT a finish_reason:'stop' delta. The 200 headers
+                                // already went out (heartbeat starts before the slot),
+                                // so the status can't change; the error object is the
+                                // only in-band way to signal a failed turn.
+                                res.write(`data: ${JSON.stringify({ error: { message: full, type: 'agy_error', code: 'permission_denied', permission: permissionClass, role } })}\n\n`);
+                                res.write('data: [DONE]\n\n');
+                                res.end();
+                                finalLog(code, rounds);
+                                freeSlot();
+                                return;
+                            }
                             if (spawnErr || timedOut || code !== 0 || emptyFail) {
                                 const msg = spawnErr
                                     ? `Nie udało się uruchomić agy: ${spawnErr.message}`
@@ -852,12 +934,16 @@ const server = http.createServer((req, res) => {
                 const bufAttempt = (n) => {
                     runAgy(null, (result) => {
                         if (clientGone) { freeSlot(); return; }
-                        const { code, out, errOut, timedOut, spawnErr, logErr, rounds } = result;
+                        const { code, out, errOut, timedOut, spawnErr, logErr, rounds, permissionClass, permissionTarget, settingsPath } = result;
+                        // Permission denial: deterministic, never retried. Distinct
+                        // HTTP 403 + code permission_denied so the caller can tell it
+                        // apart from a transient failure and NOT retry it.
+                        const permissionDenied = !!permissionClass && !out.trim();
                         // See streaming path above: IDLE is retried in-proxy (buffered mode
                         // never sent anything to the client mid-flight, so it's always safe).
-                        const transientFail = !spawnErr && (!timedOut || timedOut === 'idle') && code !== 0;
+                        const transientFail = !spawnErr && !permissionDenied && (!timedOut || timedOut === 'idle') && code !== 0;
                         // Same empty-output error signature as in stream mode.
-                        const emptyFail = !spawnErr && !timedOut && code === 0 && !out.trim();
+                        const emptyFail = !spawnErr && !permissionDenied && !timedOut && code === 0 && !out.trim();
 
                         if (transientFail && n < MAX_ATTEMPTS) {
                             console.log(`↻ agy próba ${n} nieudana (kod ${code}${timedOut ? `, timedOut=${timedOut}` : ''}) — ponawiam. stderr: ${errOut.trim().slice(0, 200)}`);
@@ -865,6 +951,17 @@ const server = http.createServer((req, res) => {
                         }
 
                         if (res.writableEnded) return;
+
+                        if (permissionDenied) {
+                            const full = buildPermissionError(role, permissionClass, permissionTarget, settingsPath);
+                            console.error(`✗ [odmowa uprawnienia] ${full}`);
+                            res.statusCode = 403;
+                            res.setHeader('Content-Type', 'application/json');
+                            res.end(JSON.stringify({ error: { message: full, type: 'agy_error', code: 'permission_denied', permission: permissionClass, role } }));
+                            finalLog(code, rounds);
+                            freeSlot();
+                            return;
+                        }
 
                         if (spawnErr || timedOut || code !== 0 || emptyFail) {
                             const msg = spawnErr
@@ -938,8 +1035,29 @@ const server = http.createServer((req, res) => {
     }
 });
 
+// Sweep preserved error glogs older than the retention window so /tmp does not
+// grow without bound. Matches only the proxy's own saved glogs (agy-timeout-/
+// agy-denied-/agy-fail-), never the live per-request agy-proxy-* files.
+function sweepOldGlogs() {
+    const dir = os.tmpdir();
+    const maxAgeMs = GLOG_RETENTION_DAYS * 86400000;
+    const now = Date.now();
+    let removed = 0;
+    try {
+        for (const name of fs.readdirSync(dir)) {
+            if (!/^agy-(timeout|denied|fail)-.*\.log$/.test(name)) continue;
+            const p = path.join(dir, name);
+            try {
+                if (now - fs.statSync(p).mtimeMs > maxAgeMs) { fs.unlinkSync(p); removed++; }
+            } catch (e) {}
+        }
+    } catch (e) {}
+    if (removed) console.log(`⛏ sprzątanie: skasowano ${removed} zachowanych glogów starszych niż ${GLOG_RETENTION_DAYS} dni`);
+}
+
 server.listen(PORT, '127.0.0.1', () => {
     console.log(`Lokalny serwer Proxy Node.js (live streaming + retry + telemetria) działa na porcie ${PORT}`);
+    sweepOldGlogs();
 });
 process.stdin.resume();
 
