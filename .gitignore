@@ -20,3 +20,6 @@ __pycache__/
 
 # home-lab implementation plan (private paths, HA entities, IP) — like PROXY.md
 PLAN_ACL_LIMITS.md
+
+# home-lab work order (private paths, cron ids) — like PROXY.md
+ZLECENIE_PERMISSION_ERRORS.md

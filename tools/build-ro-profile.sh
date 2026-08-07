@@ -27,13 +27,41 @@ RO_TOOLS=(
   ha_search ha_list_services ha_list_floors_areas ha_get_integration
   ha_get_addon ha_get_hacs_info ha_get_blueprint ha_get_camera_image
   ha_get_operation_status ha_eval_template
+  # Needed by the ha_watchdog_v2 checklist in AGENTS.md — and only reached when
+  # something is already wrong, so a missing rule here would fail the watchdog
+  # exactly during an incident. A denied tool aborts the WHOLE headless run
+  # (empty output), it does not degrade to a partial report.
+  ha_get_logs ha_get_automation_traces
   ha_config_get_automation ha_config_get_script ha_config_get_scene
   ha_config_get_dashboard ha_config_get_category ha_config_get_label
   ha_config_get_calendar_events ha_config_list_helpers ha_config_list_groups
   ha_config_list_dashboard_resources
 )
-# Read-only shell commands (agy also gates commands via permissions.allow).
-RO_COMMANDS=(ls cat grep head find which echo)
+# Shell commands allowed in the RO profile: NONE, deliberately.
+# Probed 2026-08-06 on agy 1.1.10 with `ls cat grep head find which echo` allowed:
+#   - `find … -exec sh -c …` is DENIED (a nested binary needs its own allow-rule),
+#     so shell access did NOT grant arbitrary execution — but
+#   - `grep -c . ~/.openclaw/openclaw.json` was ALLOWED and returned a count.
+#     command() matching is a PREFIX match on the command line, so arguments —
+#     including absolute paths — pass through unchecked, and trustedWorkspaces does
+#     not gate shell commands at all.
+# That makes any read command an exfiltration path for openclaw.json (API keys in
+# plaintext), config/secrets.yaml and the oauth token. The `ro` role is meant to be
+# read-only over Home Assistant, not a confidentiality boundary with holes: the 25
+# MCP read tools above already cover the job, so the shell buys nothing but surface.
+# Keep this empty. If a shell is ever genuinely needed, use path-prefixed entries
+# (e.g. `command(cat ~/projects/homeassistant/config/)`) and note that `../`
+# still defeats a prefix match.
+RO_COMMANDS=()
+
+# Native file reads. agy gates these under a THIRD permission class, `read_file`,
+# separate from `mcp` and `command` (discovered 2026-08-06 by probing: with no
+# read_file rule, agy refuses to read ANY path — including inside
+# trustedWorkspaces). Keep this list to exact files the RO role genuinely needs.
+# ha_watchdog_v2 needs AGENTS.md as its source of truth; nothing else so far.
+RO_READ_FILES=(
+  "$WORKSPACE/AGENTS.md"
+)
 
 # MCP servers to KEEP in the RO profile. nextcloud-rag is dropped: heavy,
 # long-lived process that is itself a source of false watchdog signals, and not
@@ -73,7 +101,8 @@ strip_mcp "$SRC/config/mcp_config.json"          "$DEST/config/mcp_config.json"
 python3 - "$DEST/antigravity-cli/settings.json" "$WORKSPACE" <<PY
 import json, sys
 allow  = [f"mcp(ha-mcp/{t})" for t in "${RO_TOOLS[*]}".split()]
-allow += [f"command({c})"    for c in "${RO_COMMANDS[*]}".split()]
+allow += [f"command({c})"    for c in "${RO_COMMANDS[*]:-}".split()]
+allow += [f"read_file({p})"  for p in """${RO_READ_FILES[*]:-}""".split()]
 allow += ["mcp(agy-history/agy_history_search)", "mcp(agy-history/agy_history_get)",
           "mcp(agy-history/agy_history_grep)",
           "mcp(gemini-web/gemini_web_search)", "mcp(gemini-web/gemini_web_get)",
