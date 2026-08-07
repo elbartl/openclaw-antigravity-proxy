@@ -43,7 +43,22 @@ const HARD_TIMEOUT_MS = 1800000;    // 30 min — absolute kill (authoritative)
 // tokens, and no live tool subprocess = looping without progress. A single slow
 // round can't trip it (needs several rounds); a legit long tool run can't
 // (hasActiveToolChild is true, and a blocked-on-tool agy emits no new rounds).
-const STUCK_NO_OUTPUT_MS = 420000;  // 7 min of rounds-but-no-stdout-and-no-tool => stuck, kill fast
+// NOTE this is a budget on TIME-TO-FIRST-TOKEN (total since attempt start), not
+// a stall timer — a fast-spinning loop keeps emitting rounds, so "no new round"
+// would never fire and only elapsed time discriminates. That makes the value a
+// straight bet on how long a healthy tool-heavy run may stay silent.
+// Raised 7 -> 12 min on 2026-08-07 after measuring the real workload: the
+// ha_watchdog_v2 cron normally answers in 30-90s, but two consecutive runs
+// during a live incident needed far longer (12:00 finished OK at TTFT=394s,
+// 51 rounds — 26s under the old 420s wire; 11:00 was killed at 420s with 28
+// rounds and produced nothing). The watchdog gets slowest exactly when
+// something is wrong, so a tight budget cuts hardest during an incident.
+// Round RATE does not separate the two cases (the healthy run span rounds
+// FASTER: 7.8/min vs 4/min), so raising the ceiling is the only honest fix.
+// Still well under HARD (30 min), and the permission-denial loop that
+// originally motivated STUCK now exits on its own via the glog signature,
+// so it no longer depends on this timer.
+const STUCK_NO_OUTPUT_MS = Number(process.env.AGY_STUCK_MS) || 720000;
 const STUCK_MIN_ROUNDS = 3;         // require several rounds so one slow first round isn't mistaken for a loop
 // A live tool subprocess keeps the run alive (see hasActiveToolChild), but ONLY
 // for this long past the last real progress (model round or stdout). Without a
@@ -282,6 +297,24 @@ function buildPermissionError(role, permClass, target, settingsPath) {
         return `agy odmówił uprawnienia: narzędzie klasy '${permClass}' na cel "${target}" nie jest w allowliście roli '${role}'.${where}`;
     }
     return `agy odmówił uprawnienia klasy '${permClass}' (rola '${role}'). Cel nieustalony z logu — dodaj regułę '${permClass}(<cel>)' w allowliście.${where}`;
+}
+
+// Machine-readable label for a failed run. Kept as one function so the stream
+// and buffered paths cannot drift apart — they previously disagreed (buffered
+// collapsed every timeout into 'agy_failed'), which made proxy logs and cron
+// history describe the same failure differently.
+// Minutes for humans: STUCK_NO_OUTPUT_MS is env-tunable, so a raw /60000
+// printed things like "0.16666666666666666 min" in the user-facing message.
+const mins = ms => Number((ms / 60000).toFixed(1));
+
+function failureCode({ spawnErr, timedOut, code, emptyFail }) {
+    if (spawnErr) return 'spawn_failed';
+    if (timedOut === 'stuck') return 'stuck_no_progress';
+    if (timedOut === 'idle') return 'idle_timeout';
+    if (timedOut === 'hard') return 'hard_timeout';
+    if (code !== 0) return 'agy_failed';
+    if (emptyFail) return 'empty_response';
+    return 'agy_failed';
 }
 
 // Live-tail agy's private glog file and report agent-loop activity. Each
@@ -875,7 +908,7 @@ const server = http.createServer((req, res) => {
                                 const msg = spawnErr
                                     ? `Nie udało się uruchomić agy: ${spawnErr.message}`
                                     : timedOut === 'stuck'
-                                        ? `agy utknął w pętli bez postępu — ${rounds} rund do modelu i ani jednej odpowiedzi przez ${STUCK_NO_OUTPUT_MS / 60000} min. Zwykle znaczy brak potrzebnego narzędzia lub uprawnień do zadania. Przerwane.`
+                                        ? `agy utknął bez pierwszego tokenu — ${rounds} rund do modelu i zero odpowiedzi przez ${mins(STUCK_NO_OUTPUT_MS)} min, bez żywego narzędzia. Możliwa pętla (brak narzędzia/uprawnienia), ale równie dobrze zdrowe długie śledztwo, któremu zabrakło budżetu — sprawdź glog i rozważ AGY_STUCK_MS. Przerwane.`
                                     : timedOut === 'idle'
                                         ? `agy przerwany — brak aktywności przez ${IDLE_TIMEOUT_MS / 60000} min (po ${elapsed()}s, rund: ${rounds})`
                                         : timedOut === 'hard'
@@ -886,7 +919,21 @@ const server = http.createServer((req, res) => {
                                 const detail = summarizeAgyError(logErr) || errOut.trim().slice(0, 300) || null;
                                 const full = detail ? `${msg}: ${detail}` : msg;
                                 console.error(`✗ ${full}`);
-                                sendDelta(`\n⚠️ [proxy] ${full}`, 'stop');
+                                // Error EVENT, not a content delta — same reason as the
+                                // permission branch above. A delta with finish_reason:'stop'
+                                // is indistinguishable from a normal answer upstream, so
+                                // every failure here was booked as a successful turn.
+                                // Measured cost, 2026-08-07 11:07: a STUCK kill (28 rounds,
+                                // zero output, 420s) was written to cron history as
+                                // `status = ok`, consecutiveErrors stayed 0 and failureAlert
+                                // never fired — one hour of HA monitoring vanished and the
+                                // ⚠️ text was delivered to the channel as if it were the
+                                // watchdog's report. Known trade-off: OpenClaw retries an
+                                // error object ~4x, so a genuinely stuck run now costs
+                                // several attempts instead of one. Capping that belongs to
+                                // the cron/gateway config, not here — a silent success is
+                                // the worse failure mode.
+                                res.write(`data: ${JSON.stringify({ error: { message: full, type: 'agy_error', code: failureCode({ spawnErr, timedOut, code, emptyFail }), role } })}\n\n`);
                             } else {
                                 sendDelta(null, 'stop');
                             }
@@ -967,7 +1014,7 @@ const server = http.createServer((req, res) => {
                             const msg = spawnErr
                                 ? `Nie udało się uruchomić agy: ${spawnErr.message}`
                                 : timedOut === 'stuck'
-                                    ? `agy utknął w pętli bez postępu — ${rounds} rund do modelu i ani jednej odpowiedzi przez ${STUCK_NO_OUTPUT_MS / 60000} min. Zwykle znaczy brak potrzebnego narzędzia lub uprawnień do zadania. Przerwane.`
+                                    ? `agy utknął bez pierwszego tokenu — ${rounds} rund do modelu i zero odpowiedzi przez ${mins(STUCK_NO_OUTPUT_MS)} min, bez żywego narzędzia. Możliwa pętla (brak narzędzia/uprawnienia), ale równie dobrze zdrowe długie śledztwo, któremu zabrakło budżetu — sprawdź glog i rozważ AGY_STUCK_MS. Przerwane.`
                                 : timedOut === 'idle'
                                     ? `agy przerwany — brak aktywności przez ${IDLE_TIMEOUT_MS / 60000} min (po ${elapsed()}s, rund: ${rounds})`
                                     : timedOut === 'hard'
@@ -980,7 +1027,7 @@ const server = http.createServer((req, res) => {
                             console.error(`✗ ${full}`);
                             res.statusCode = spawnErr ? 502 : timedOut ? 504 : 500;
                             res.setHeader('Content-Type', 'application/json');
-                            res.end(JSON.stringify({ error: { message: full, type: 'agy_error', code: emptyFail ? 'empty_response' : 'agy_failed' } }));
+                            res.end(JSON.stringify({ error: { message: full, type: 'agy_error', code: failureCode({ spawnErr, timedOut, code, emptyFail }), role } }));
                             finalLog(code, rounds);
                             freeSlot();
                             return;
@@ -1045,7 +1092,14 @@ function sweepOldGlogs() {
     let removed = 0;
     try {
         for (const name of fs.readdirSync(dir)) {
-            if (!/^agy-(timeout|denied|fail)-.*\.log$/.test(name)) continue;
+            // Match ANY agy-<kind>- glog, not an enumerated prefix list. The
+            // old list was (timeout|denied|fail) and silently stopped sweeping
+            // when a prefix was renamed: on 2026-08-07 /tmp still held 23 files,
+            // oldest from 07-20 (18 days at a 7-day retention), all named
+            // agy-stuck-* / agy-bis-* from earlier proxy versions.
+            // Live per-request files (agy-proxy-*) are safe to include here:
+            // they can only be minutes old, and the mtime test below is days.
+            if (!/^agy-[a-z]+-.*\.log$/.test(name)) continue;
             const p = path.join(dir, name);
             try {
                 if (now - fs.statSync(p).mtimeMs > maxAgeMs) { fs.unlinkSync(p); removed++; }
